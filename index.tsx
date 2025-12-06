@@ -278,9 +278,13 @@ class LabAIService {
 
     try {
       const ai = new GoogleGenAI({ apiKey: k.key });
-      const model = ai.getGenerativeModel({ model: 'gemini-2.5-flash' });
-      const result = await model.generateContent("Hello");
-      if (result.response.text()) {
+      const model = ai.models;
+      // Simple test using generateContent
+      const result = await model.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: "Hello"
+      });
+      if (result.text) {
         k.status = 'active';
         return true;
       }
@@ -516,6 +520,7 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
       });
       streamRef.current = stream;
 
+      // Currently using Flash 2.5 as it's the standard for Live API
       const model = 'gemini-2.5-flash-native-audio-preview-09-2025';
       
       const historyText = messages.map(m => `${m.role === 'user' ? 'کاربر' : 'مدل'}: ${m.text}`).join('\n');
@@ -655,8 +660,8 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
               };
             }
           },
-          onclose: () => {
-            console.log("Session Closed");
+          onclose: (e) => {
+            console.log("Session Closed", e);
             setIsConnected(false);
           },
           onerror: (err) => {
@@ -789,6 +794,130 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
 
         <div className="absolute right-4 bottom-4">
            {isConnected ? <Wifi size={16} className="text-green-500" /> : <WifiOff size={16} className="text-slate-600" />}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- ANALYSIS MODULE (Restored) ---
+const AnalysisModule = ({ onSave }: { onSave: (result: AnalysisResult) => void }) => {
+  const [image, setImage] = useState<string | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [result, setResult] = useState<AnalysisResult | null>(null);
+
+  const handleAnalyze = async () => {
+    if (!image) return;
+    setAnalyzing(true);
+    const res = await aiService.analyzePlateImage(image);
+    if (res) {
+      setResult(res);
+      onSave(res);
+    }
+    setAnalyzing(false);
+  };
+
+  const handleUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+         const base64 = (reader.result as string).split(',')[1];
+         setImage(base64);
+         setResult(null);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  return (
+    <div className="space-y-6 animate-fade-in">
+      <header>
+         <h2 className="text-2xl font-bold text-slate-800 flex items-center gap-2">
+           <Activity className="text-blue-600"/>
+           آنالیز هوشمند و تشخیص
+         </h2>
+         <p className="text-slate-500 text-sm mt-1">تشخیص کلونی‌ها و آنتی‌بیوگرام از روی تصویر پلیت</p>
+      </header>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="space-y-4">
+          <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm min-h-[300px] flex flex-col items-center justify-center relative overflow-hidden group">
+            {image ? (
+              <img src={`data:image/jpeg;base64,${image}`} className="w-full h-full object-contain" />
+            ) : (
+              <div className="text-center text-slate-400">
+                <Upload size={48} className="mx-auto mb-2 opacity-50" />
+                <p className="font-bold">آپلود تصویر پلیت</p>
+                <p className="text-xs">برای شروع عکس را اینجا رها کنید یا کلیک کنید</p>
+              </div>
+            )}
+            <input type="file" className="absolute inset-0 opacity-0 cursor-pointer" onChange={handleUpload} accept="image/*" />
+          </div>
+          
+          <button 
+            onClick={handleAnalyze} 
+            disabled={!image || analyzing}
+            className={`w-full py-4 rounded-xl font-bold text-white shadow-lg shadow-blue-200 flex items-center justify-center gap-2 transition-all ${!image || analyzing ? 'bg-slate-300' : 'bg-blue-600 hover:bg-blue-700 hover:scale-[1.02]'}`}
+          >
+            {analyzing ? (
+              <>
+                <div className="w-5 h-5 border-2 border-white/50 border-t-white rounded-full animate-spin"></div>
+                در حال آنالیز هوشمند...
+              </>
+            ) : (
+              <>
+                <Microscope size={20} />
+                شروع آنالیز
+              </>
+            )}
+          </button>
+        </div>
+
+        <div className="space-y-4">
+          {result ? (
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden animate-fade-in">
+              <div className="p-4 bg-gradient-to-r from-blue-600 to-indigo-600 text-white">
+                <h3 className="font-bold text-lg">{result.organism_suspicion}</h3>
+                <div className="flex items-center gap-4 text-xs mt-1 opacity-90">
+                   <span className="flex items-center gap-1"><ShieldCheck size={12}/> اطمینان: {result.confidence}</span>
+                   <span className="flex items-center gap-1"><Clock size={12}/> رشد: {result.growth_stage}</span>
+                </div>
+              </div>
+              <div className="p-5 space-y-4">
+                <div>
+                  <span className="text-xs font-bold text-slate-400 uppercase">مورفولوژی</span>
+                  <p className="text-sm text-slate-700 mt-1">{result.colony_morphology}</p>
+                </div>
+                <div>
+                  <span className="text-xs font-bold text-slate-400 uppercase">تفسیر آنتی‌بیوگرام</span>
+                  <div className="mt-2 space-y-2">
+                    {result.antibiotic_results.map((ab, i) => (
+                      <div key={i} className="flex justify-between items-center bg-slate-50 p-2 rounded-lg text-sm">
+                        <span className="font-bold text-slate-700">{ab.name}</span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs text-slate-500">{ab.zone_size_mm}mm</span>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            ab.interpretation === 'Sensitive' ? 'bg-green-100 text-green-700' :
+                            ab.interpretation === 'Resistant' ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-700'
+                          }`}>{ab.interpretation}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="bg-blue-50 p-3 rounded-xl border border-blue-100">
+                  <span className="text-blue-600 text-xs font-bold block mb-1">توصیه بالینی</span>
+                  <p className="text-sm text-blue-900">{result.recommendation}</p>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="h-full bg-slate-50 rounded-2xl border-2 border-dashed border-slate-200 flex flex-col items-center justify-center text-slate-400 p-8 text-center opacity-60">
+               <Activity size={48} className="mb-4" />
+               <p className="text-sm">نتایج آنالیز اینجا نمایش داده می‌شود</p>
+            </div>
+          )}
         </div>
       </div>
     </div>
