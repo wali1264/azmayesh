@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef, createContext, useContext, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Modality } from "@google/genai";
@@ -55,7 +56,11 @@ import {
   Grid,
   Scissors,
   Circle,
-  Layers
+  Layers,
+  Key,
+  ShieldCheck,
+  Ban,
+  Play
 } from 'lucide-react';
 
 // --- TYPES & INTERFACES ---
@@ -91,11 +96,11 @@ interface UserProfile {
 }
 
 interface VitalsData {
-  temp: { value: number; enabled: boolean };
-  hr: { value: number; enabled: boolean };
-  bp: { sys: number; dia: number; enabled: boolean };
-  spo2: { value: number; enabled: boolean };
-  weight: { value: number; enabled: boolean };
+  temp: { value: number | ''; enabled: boolean };
+  hr: { value: number | ''; enabled: boolean };
+  bp: { sys: number | ''; dia: number | ''; enabled: boolean };
+  spo2: { value: number | ''; enabled: boolean };
+  weight: { value: number | ''; enabled: boolean };
 }
 
 interface ClinicalDiagnosisResult {
@@ -106,6 +111,16 @@ interface ClinicalDiagnosisResult {
     standard: { name: string; description: string };
     emergency: { name: string; recipe: string };
   };
+}
+
+interface KeyStat {
+  index: number;
+  key: string;
+  mask: string;
+  requests: number;
+  errors: number;
+  status: 'active' | 'cooldown' | 'dead';
+  lastUsed: number;
 }
 
 // --- AUDIO UTILS ---
@@ -142,23 +157,18 @@ function floatTo16BitPCM(input: Float32Array): Int16Array {
   return output;
 }
 
-// --- AI SERVICE WITH MULTI-KEY LOAD BALANCING ---
+// --- AI SERVICE WITH MULTI-KEY LOAD BALANCING & STATS ---
 
 class LabAIService {
   private modelName = 'gemini-2.5-flash';
-  private apiKeys: string[] = [];
+  private keys: KeyStat[] = [];
   private currentKeyIndex = 0;
 
   constructor() {
     this.harvestKeys();
   }
 
-  /**
-   * Automatically discovers keys starting from VITE_GOOGLE_GENAI_TOKEN_1.
-   * Supports import.meta.env (Vite) and process.env.
-   */
   private harvestKeys() {
-    // Try to access the Vite env object safely
     let env: any = {};
     try {
       // @ts-ignore
@@ -168,13 +178,11 @@ class LabAIService {
       }
     } catch (e) {}
 
-    // Combine with process.env if available
     if (typeof process !== 'undefined' && process.env) {
       env = { ...env, ...process.env };
     }
 
     let index = 1;
-    // Check up to 50 keys to be safe and "unlimited" enough for practical purposes
     const MAX_KEYS = 50; 
     
     while (index <= MAX_KEYS) {
@@ -182,70 +190,134 @@ class LabAIService {
       const key = env[keyName];
 
       if (key && typeof key === 'string' && key.startsWith('AIza')) {
-        this.apiKeys.push(key);
+        this.addKey(key, index);
       } 
       index++;
     }
 
-    // Fallback: Check for single key
-    if (this.apiKeys.length === 0) {
+    if (this.keys.length === 0) {
       const singleKey = env.VITE_GOOGLE_GENAI_TOKEN || env.API_KEY || env.VITE_API_KEY;
       if (singleKey) {
-        this.apiKeys.push(singleKey);
+        this.addKey(singleKey, 0);
       }
     }
 
-    if (this.apiKeys.length === 0) {
-      console.warn("No API Keys found! Please set VITE_GOOGLE_GENAI_TOKEN_1, etc.");
-      // Do not push dummy key, let it fail gracefully or handle in UI
-    } else {
-      console.log(`LabAIService initialized with ${this.apiKeys.length} keys.`);
+    console.log(`LabAIService initialized with ${this.keys.length} keys.`);
+  }
+
+  private addKey(key: string, index: number) {
+    this.keys.push({
+      index,
+      key,
+      mask: `...${key.slice(-4)}`,
+      requests: 0,
+      errors: 0,
+      status: 'active',
+      lastUsed: 0
+    });
+  }
+
+  getKeyStats() {
+    return [...this.keys];
+  }
+
+  reportSuccess(keyIndex: number) {
+    const k = this.keys.find(k => k.index === keyIndex);
+    if (k) {
+      k.requests++;
+      k.lastUsed = Date.now();
+      k.status = 'active';
     }
   }
 
-  /**
-   * Returns a client using the next key in rotation.
-   */
-  getLiveClient(): { client: GoogleGenAI, keyIndex: number } | null {
-    if (this.apiKeys.length === 0) return null;
-    const key = this.getNextKey();
-    return { client: new GoogleGenAI({ apiKey: key }), keyIndex: this.currentKeyIndex };
+  reportError(keyIndex: number) {
+    const k = this.keys.find(k => k.index === keyIndex);
+    if (k) {
+      k.errors++;
+      k.lastUsed = Date.now();
+      // If errors exceed 5, mark as dead? For now, just track.
+      // Or cooldown logic could go here.
+    }
+  }
+
+  getLiveClient(): { client: GoogleGenAI, keyIndex: number, keyMask: string } | null {
+    if (this.keys.length === 0) return null;
+    
+    // Simple rotation skipping dead keys
+    let attempts = 0;
+    while (attempts < this.keys.length) {
+      const k = this.keys[this.currentKeyIndex];
+      this.currentKeyIndex = (this.currentKeyIndex + 1) % this.keys.length;
+      
+      if (k.status !== 'dead') {
+        return { 
+          client: new GoogleGenAI({ apiKey: k.key }), 
+          keyIndex: k.index,
+          keyMask: k.mask 
+        };
+      }
+      attempts++;
+    }
+    
+    // If all dead, try the first one anyway
+    const fallback = this.keys[0];
+    return { 
+      client: new GoogleGenAI({ apiKey: fallback.key }), 
+      keyIndex: fallback.index,
+      keyMask: fallback.mask 
+    };
   }
 
   rotateKey() {
-    this.currentKeyIndex = (this.currentKeyIndex + 1) % this.apiKeys.length;
+    this.currentKeyIndex = (this.currentKeyIndex + 1) % this.keys.length;
   }
 
-  private getNextKey(): string {
-    const key = this.apiKeys[this.currentKeyIndex];
-    // Rotate index for next call
-    this.currentKeyIndex = (this.currentKeyIndex + 1) % this.apiKeys.length;
-    return key;
+  async testKey(index: number): Promise<boolean> {
+    const k = this.keys.find(k => k.index === index);
+    if (!k) return false;
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: k.key });
+      const model = ai.getGenerativeModel({ model: 'gemini-2.5-flash' });
+      const result = await model.generateContent("Hello");
+      if (result.response.text()) {
+        k.status = 'active';
+        return true;
+      }
+      return false;
+    } catch (e) {
+      console.error(`Key ${index} test failed:`, e);
+      k.status = 'dead';
+      return false;
+    }
   }
 
-  /**
-   * Executes an AI operation with automatic failover.
-   */
   private async executeWithRetry<T>(operation: (ai: GoogleGenAI) => Promise<T>): Promise<T> {
-    if (this.apiKeys.length === 0) throw new Error("No API Keys configured.");
+    if (this.keys.length === 0) throw new Error("No API Keys configured.");
 
     let attempts = 0;
-    const maxAttempts = this.apiKeys.length * 2; 
+    const maxAttempts = this.keys.length * 2; 
 
     while (attempts < maxAttempts) {
-      const currentKey = this.getNextKey();
+      const k = this.keys[this.currentKeyIndex];
+      this.currentKeyIndex = (this.currentKeyIndex + 1) % this.keys.length;
       
+      if (k.status === 'dead') continue;
+
       try {
-        const ai = new GoogleGenAI({ apiKey: currentKey });
-        return await operation(ai);
+        const ai = new GoogleGenAI({ apiKey: k.key });
+        const res = await operation(ai);
+        this.reportSuccess(k.index);
+        return res;
       } catch (error: any) {
-        console.warn(`Request failed with key ending in ...${currentKey.slice(-4)}:`, error.message);
+        this.reportError(k.index);
+        console.warn(`Request failed with key ${k.index} (${k.mask}):`, error.message);
 
         const isQuotaError = error.message?.includes('429') || error.status === 429;
         const isAuthError = error.message?.includes('403') || error.status === 403;
 
         if (isQuotaError || isAuthError) {
-          console.log("Switching to next key due to quota/auth limit...");
+          k.status = 'cooldown'; // Mark as cooldown
           attempts++;
           continue;
         }
@@ -383,7 +455,7 @@ const MobileNavItem = ({ icon: Icon, label, active, onClick }: any) => (
   </button>
 );
 
-// --- LiveVoiceAssistant with Retry Logic ---
+// --- LiveVoiceAssistant with Key Stats ---
 const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialContext: string, persona?: 'clinical' | 'qc' }) => {
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
@@ -399,6 +471,7 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
   const audioQueueRef = useRef<AudioBufferSourceNode[]>([]);
   const nextStartTimeRef = useRef<number>(0);
   const sessionRef = useRef<any>(null);
+  const currentKeyIndexRef = useRef<number>(-1);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -470,6 +543,7 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
       }
 
       console.log("Connecting with key index:", clientData.keyIndex);
+      currentKeyIndexRef.current = clientData.keyIndex;
 
       const sessionPromise = clientData.client.live.connect({
         model: model,
@@ -488,6 +562,7 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
             setIsConnecting(false);
             setIsConnected(true);
             setRetryCount(0);
+            aiService.reportSuccess(clientData.keyIndex);
             
             sessionPromise.then(s => {
               sessionRef.current = s;
@@ -508,15 +583,12 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
               const base64 = arrayBufferToBase64(uint8.buffer);
 
               sessionPromise.then(session => {
-                // Check valid session
                 if (session && isConnected) {
                   try {
                     session.sendRealtimeInput({
                       media: { mimeType: "audio/pcm;rate=16000", data: base64 }
                     });
-                  } catch (err) {
-                     // Socket might be closed
-                  }
+                  } catch (err) { }
                 }
               });
             };
@@ -589,12 +661,12 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
           },
           onerror: (err) => {
             console.error("Session Error", err);
+            aiService.reportError(currentKeyIndexRef.current);
             // RETRY LOGIC
             if (retryCount < 3) {
               console.log("Retrying connection with new key...");
               setRetryCount(prev => prev + 1);
               disconnect();
-              // Short delay then retry
               setTimeout(() => {
                 aiService.rotateKey();
                 connect();
@@ -610,7 +682,6 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
     } catch (err) {
       console.error(err);
       setIsConnecting(false);
-       // Retry on catch as well
        if (retryCount < 3) {
           setRetryCount(prev => prev + 1);
           setTimeout(() => {
@@ -724,14 +795,7 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
   );
 };
 
-// ... Clinical Console (no changes needed) ...
-// ... Analysis Module (no changes needed) ...
-// ... Settings Module (no changes needed) ...
-// ... Lab Resources Module (no changes needed) ...
-
 const ClinicalConsoleModule = () => {
-  // ... (Code as previously defined) ...
-  // Re-inserting Clinical Console Logic to ensure full file integrity
   const [vitals, setVitals] = useState<VitalsData>({
     temp: { value: 37.0, enabled: true },
     hr: { value: 72, enabled: true },
@@ -749,12 +813,18 @@ const ClinicalConsoleModule = () => {
   const toggleVital = (key: keyof VitalsData) => {
     setVitals(prev => ({ ...prev, [key]: { ...prev[key], enabled: !prev[key].enabled } }));
   };
-  const updateSimpleVital = (key: keyof VitalsData, val: number) => {
-    setVitals(prev => ({ ...prev, [key]: { ...prev[key], value: val } }));
+  
+  // FIX: Allow empty string for smooth typing
+  const updateSimpleVital = (key: keyof VitalsData, val: string) => {
+    setVitals(prev => ({ ...prev, [key]: { ...prev[key], value: val === '' ? '' : Number(val) } }));
   };
-  const updateBP = (type: 'sys' | 'dia', val: number) => {
-    setVitals(prev => ({ ...prev, bp: { ...prev.bp, [type]: val } }));
+  const updateBP = (type: 'sys' | 'dia', val: string) => {
+    setVitals(prev => ({ 
+      ...prev, 
+      bp: { ...prev.bp, [type]: val === '' ? '' : Number(val) } 
+    }));
   };
+
   const toggleHistorySpeech = () => {
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SpeechRecognition) { alert('مرورگر پشتیبانی نمی‌کند'); return; }
@@ -820,17 +890,18 @@ const ClinicalConsoleModule = () => {
                   <div className="text-2xl font-black text-blue-900 tracking-tight">{vitals.bp.sys} <span className="text-slate-400 text-lg">/</span> {vitals.bp.dia}</div>
                </div>
                <div className="grid grid-cols-1 gap-6">
-                 <div className="relative pt-1"><div className="flex justify-between text-xs font-bold text-slate-400 mb-1"><span>SYS (سیستولیک)</span><span>{vitals.bp.sys}</span></div><input type="range" min="70" max="220" step="1" value={vitals.bp.sys} onChange={(e) => updateBP('sys', parseInt(e.target.value))} disabled={!vitals.bp.enabled} className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"/></div>
-                 <div className="relative pt-1"><div className="flex justify-between text-xs font-bold text-slate-400 mb-1"><span>DIA (دیاستولیک)</span><span>{vitals.bp.dia}</span></div><input type="range" min="40" max="130" step="1" value={vitals.bp.dia} onChange={(e) => updateBP('dia', parseInt(e.target.value))} disabled={!vitals.bp.enabled} className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-sky-500"/></div>
+                 <div className="relative pt-1"><div className="flex justify-between text-xs font-bold text-slate-400 mb-1"><span>SYS (سیستولیک)</span><span>{vitals.bp.sys}</span></div><input type="range" min="70" max="220" step="1" value={vitals.bp.sys || 70} onChange={(e) => updateBP('sys', e.target.value)} disabled={!vitals.bp.enabled} className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"/></div>
+                 <div className="relative pt-1"><div className="flex justify-between text-xs font-bold text-slate-400 mb-1"><span>DIA (دیاستولیک)</span><span>{vitals.bp.dia}</span></div><input type="range" min="40" max="130" step="1" value={vitals.bp.dia || 40} onChange={(e) => updateBP('dia', e.target.value)} disabled={!vitals.bp.enabled} className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-sky-500"/></div>
                </div>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className={`p-4 rounded-xl border border-slate-100 transition-all ${vitals.spo2.enabled ? 'bg-cyan-50/50' : 'bg-slate-50 opacity-60'}`}><div className="flex justify-between items-center mb-3"><div className="flex items-center gap-2"><input type="checkbox" checked={vitals.spo2.enabled} onChange={() => toggleVital('spo2')} className="w-4 h-4 rounded text-cyan-600" /><label className="font-bold text-sm flex items-center gap-1"><Wind size={16} className="text-cyan-600"/> اکسیژن (SPO2)</label></div><span className={`font-black text-lg ${vitals.spo2.value < 95 ? 'text-red-500' : 'text-cyan-700'}`}>{vitals.spo2.value}%</span></div><input type="range" min="70" max="100" value={vitals.spo2.value} onChange={(e) => updateSimpleVital('spo2', parseInt(e.target.value))} disabled={!vitals.spo2.enabled} className="w-full h-2 bg-slate-200 rounded-lg accent-cyan-600" /></div>
-              <div className={`p-4 rounded-xl border border-slate-100 transition-all ${vitals.hr.enabled ? 'bg-rose-50/50' : 'bg-slate-50 opacity-60'}`}><div className="flex justify-between items-center mb-3"><div className="flex items-center gap-2"><input type="checkbox" checked={vitals.hr.enabled} onChange={() => toggleVital('hr')} className="w-4 h-4 rounded text-rose-600" /><label className="font-bold text-sm flex items-center gap-1"><Heart size={16} className="text-rose-600"/> ضربان (HR)</label></div><span className={`font-black text-lg ${vitals.hr.value > 100 ? 'text-rose-600' : 'text-slate-700'}`}>{vitals.hr.value}</span></div><input type="range" min="40" max="200" value={vitals.hr.value} onChange={(e) => updateSimpleVital('hr', parseInt(e.target.value))} disabled={!vitals.hr.enabled} className="w-full h-2 bg-slate-200 rounded-lg accent-rose-500" /></div>
-              <div className={`p-4 rounded-xl border border-slate-100 transition-all ${vitals.weight.enabled ? 'bg-indigo-50/50' : 'bg-slate-50 opacity-60'}`}><div className="flex justify-between items-center mb-3"><div className="flex items-center gap-2"><input type="checkbox" checked={vitals.weight.enabled} onChange={() => toggleVital('weight')} className="w-4 h-4 rounded text-indigo-600" /><label className="font-bold text-sm flex items-center gap-1"><Scale size={16} className="text-indigo-600"/> وزن (Weight)</label></div><span className="font-black text-lg text-indigo-900">{vitals.weight.value} <span className="text-xs font-medium text-slate-400">kg</span></span></div><input type="range" min="3" max="150" value={vitals.weight.value} onChange={(e) => updateSimpleVital('weight', parseInt(e.target.value))} disabled={!vitals.weight.enabled} className="w-full h-2 bg-slate-200 rounded-lg accent-indigo-600" /></div>
-              <div className={`p-4 rounded-xl border border-slate-100 transition-all ${vitals.temp.enabled ? 'bg-orange-50/50' : 'bg-slate-50 opacity-60'}`}><div className="flex justify-between items-center mb-3"><div className="flex items-center gap-2"><input type="checkbox" checked={vitals.temp.enabled} onChange={() => toggleVital('temp')} className="w-4 h-4 rounded text-orange-600" /><label className="font-bold text-sm flex items-center gap-1"><Thermometer size={16} className="text-orange-600"/> دما (Temp)</label></div><span className={`font-black text-lg ${vitals.temp.value > 37.5 ? 'text-orange-600' : 'text-slate-700'}`}>{vitals.temp.value}°c</span></div><input type="range" min="35" max="42" step="0.1" value={vitals.temp.value} onChange={(e) => updateSimpleVital('temp', parseFloat(e.target.value))} disabled={!vitals.temp.enabled} className="w-full h-2 bg-slate-200 rounded-lg accent-orange-500" /></div>
+              <div className={`p-4 rounded-xl border border-slate-100 transition-all ${vitals.spo2.enabled ? 'bg-cyan-50/50' : 'bg-slate-50 opacity-60'}`}><div className="flex justify-between items-center mb-3"><div className="flex items-center gap-2"><input type="checkbox" checked={vitals.spo2.enabled} onChange={() => toggleVital('spo2')} className="w-4 h-4 rounded text-cyan-600" /><label className="font-bold text-sm flex items-center gap-1"><Wind size={16} className="text-cyan-600"/> اکسیژن (SPO2)</label></div><span className={`font-black text-lg ${Number(vitals.spo2.value) < 95 ? 'text-red-500' : 'text-cyan-700'}`}>{vitals.spo2.value}%</span></div><input type="range" min="70" max="100" value={vitals.spo2.value || 70} onChange={(e) => updateSimpleVital('spo2', e.target.value)} disabled={!vitals.spo2.enabled} className="w-full h-2 bg-slate-200 rounded-lg accent-cyan-600" /></div>
+              <div className={`p-4 rounded-xl border border-slate-100 transition-all ${vitals.hr.enabled ? 'bg-rose-50/50' : 'bg-slate-50 opacity-60'}`}><div className="flex justify-between items-center mb-3"><div className="flex items-center gap-2"><input type="checkbox" checked={vitals.hr.enabled} onChange={() => toggleVital('hr')} className="w-4 h-4 rounded text-rose-600" /><label className="font-bold text-sm flex items-center gap-1"><Heart size={16} className="text-rose-600"/> ضربان (HR)</label></div><span className={`font-black text-lg ${Number(vitals.hr.value) > 100 ? 'text-rose-600' : 'text-slate-700'}`}>{vitals.hr.value}</span></div><input type="range" min="40" max="200" value={vitals.hr.value || 40} onChange={(e) => updateSimpleVital('hr', e.target.value)} disabled={!vitals.hr.enabled} className="w-full h-2 bg-slate-200 rounded-lg accent-rose-500" /></div>
+              <div className={`p-4 rounded-xl border border-slate-100 transition-all ${vitals.weight.enabled ? 'bg-indigo-50/50' : 'bg-slate-50 opacity-60'}`}><div className="flex justify-between items-center mb-3"><div className="flex items-center gap-2"><input type="checkbox" checked={vitals.weight.enabled} onChange={() => toggleVital('weight')} className="w-4 h-4 rounded text-indigo-600" /><label className="font-bold text-sm flex items-center gap-1"><Scale size={16} className="text-indigo-600"/> وزن (Weight)</label></div><span className="font-black text-lg text-indigo-900">{vitals.weight.value} <span className="text-xs font-medium text-slate-400">kg</span></span></div><input type="range" min="3" max="150" value={vitals.weight.value || 3} onChange={(e) => updateSimpleVital('weight', e.target.value)} disabled={!vitals.weight.enabled} className="w-full h-2 bg-slate-200 rounded-lg accent-indigo-600" /></div>
+              <div className={`p-4 rounded-xl border border-slate-100 transition-all ${vitals.temp.enabled ? 'bg-orange-50/50' : 'bg-slate-50 opacity-60'}`}><div className="flex justify-between items-center mb-3"><div className="flex items-center gap-2"><input type="checkbox" checked={vitals.temp.enabled} onChange={() => toggleVital('temp')} className="w-4 h-4 rounded text-orange-600" /><label className="font-bold text-sm flex items-center gap-1"><Thermometer size={16} className="text-orange-600"/> دما (Temp)</label></div><span className={`font-black text-lg ${Number(vitals.temp.value) > 37.5 ? 'text-orange-600' : 'text-slate-700'}`}>{vitals.temp.value}°c</span></div><input type="range" min="35" max="42" step="0.1" value={vitals.temp.value || 35} onChange={(e) => updateSimpleVital('temp', e.target.value)} disabled={!vitals.temp.enabled} className="w-full h-2 bg-slate-200 rounded-lg accent-orange-500" /></div>
             </div>
           </div>
+          {/* ... History and Upload sections unchanged ... */}
           <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
             <div className="flex items-center justify-between mb-3 border-b border-slate-100 pb-2"><div className="flex items-center gap-2 text-slate-700 font-bold"><FileText size={18} /><h3>شرح حال و علائم بالینی</h3></div><div className="flex items-center gap-2"><button onClick={() => setHistoryLang(l => l === 'fa' ? 'en' : 'fa')} className="text-xs font-mono bg-slate-100 px-2 py-1 rounded flex items-center gap-1 hover:bg-slate-200"><Languages size={12} />{historyLang === 'fa' ? 'FA' : 'EN'}</button><button onClick={toggleHistorySpeech} className={`p-2 rounded-lg transition-all ${isListeningHistory ? 'bg-red-500 text-white animate-pulse shadow-md' : 'bg-blue-50 text-blue-600 hover:bg-blue-100'}`} title="شروع دیکته صوتی">{isListeningHistory ? <MicOff size={16} /> : <Mic size={16} />}</button></div></div>
             <textarea value={historyText} onChange={(e) => setHistoryText(e.target.value)} placeholder={historyLang === 'fa' ? "شرح حال بیمار را تایپ کنید یا بگویید..." : "Dictate patient history..."} className="w-full h-32 p-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:outline-none text-sm resize-none" dir={historyLang === 'fa' ? 'rtl' : 'ltr'}/>
@@ -861,7 +932,6 @@ const ClinicalConsoleModule = () => {
   );
 };
 
-// --- LiveLabModule with Retry Logic ---
 const LiveLabModule = () => {
   const [active, setActive] = useState(false);
   const [micOn, setMicOn] = useState(true);
@@ -884,7 +954,9 @@ const LiveLabModule = () => {
   const prevFrameDataRef = useRef<Uint8ClampedArray | null>(null);
   const lastSendTimeRef = useRef<number>(0);
   const volumeRef = useRef<number>(0);
+  const currentKeyIndexRef = useRef<number>(-1);
 
+  // ... (Motion Detection Logic) ...
   const detectMotion = (ctx: CanvasRenderingContext2D, width: number, height: number): boolean => {
     const imageData = ctx.getImageData(0, 0, width, height);
     const data = imageData.data;
@@ -955,6 +1027,7 @@ const LiveLabModule = () => {
       }
 
       console.log("Connecting LiveLab with key index:", clientData.keyIndex);
+      currentKeyIndexRef.current = clientData.keyIndex;
 
       const sessionPromise = clientData.client.live.connect({
         model: model,
@@ -973,6 +1046,7 @@ const LiveLabModule = () => {
           onopen: () => {
             setStatus('connected');
             setRetryCount(0);
+            aiService.reportSuccess(clientData.keyIndex);
             
             sessionPromise.then(s => {
               sessionRef.current = s;
@@ -1104,6 +1178,7 @@ const LiveLabModule = () => {
           },
           onerror: (err) => {
             console.error("Session error:", err);
+            aiService.reportError(currentKeyIndexRef.current);
             // RETRY LOGIC
             if (retryCount < 3) {
               console.log("Retrying LiveLab connection with new key...");
@@ -1317,74 +1392,87 @@ const LiveLabModule = () => {
   );
 };
 
-// ... AnalysisModule (no changes needed) ...
-// ... SettingsModule (no changes needed) ...
-// ... LabResourcesModule (no changes needed) ...
-// ... App Component (no changes needed) ...
-
-const AnalysisModule = ({ onSave }: { onSave: (result: AnalysisResult) => void }) => {
-  // Re-inserting Analysis Module Logic
-  const [imagePreview, setImagePreview] = useState<string | null>(null);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [result, setResult] = useState<AnalysisResult | null>(null);
-  const [saved, setSaved] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => { setImagePreview(reader.result as string); setResult(null); setSaved(false); };
-      reader.readAsDataURL(file);
-    }
-  };
-  const startAnalysis = async () => {
-    if (!imagePreview) return;
-    setIsAnalyzing(true);
-    const base64Data = imagePreview.split(',')[1];
-    const analysisResult = await aiService.analyzePlateImage(base64Data);
-    if (analysisResult) setResult(analysisResult);
-    setIsAnalyzing(false);
-  };
-  const handleSave = () => { if (result) { onSave(result); setSaved(true); } };
-  const resetAnalysis = () => { setImagePreview(null); setResult(null); setSaved(false); if (fileInputRef.current) fileInputRef.current.value = ''; };
-
-  return (
-    <div className="space-y-6">
-      <header className="flex justify-between items-end">
-        <div><h2 className="text-2xl font-bold text-slate-800 flex items-center gap-2"><Activity className="text-blue-600" />آنالیز هوشمند و تشخیص</h2><p className="text-slate-500 text-sm mt-1">اسکن پلیت، تشخیص زودهنگام و آنتی‌بیوگرام دیجیتال</p></div>
-        <div className="flex gap-2">{result && !saved && (<button onClick={handleSave} className="px-4 py-2 bg-green-600 text-white rounded-xl text-sm font-bold shadow-lg shadow-green-200 hover:bg-green-700 transition-colors flex items-center gap-2"><Save size={16} />ذخیره در پرونده</button>)}{result && (<button onClick={resetAnalysis} className="text-sm text-blue-600 hover:text-blue-800 flex items-center gap-1 bg-white px-3 py-2 rounded-xl border border-blue-100"><RefreshCw size={14} />آنالیز جدید</button>)}</div>
-      </header>
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 h-[calc(100vh-200px)]">
-        <div className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm flex flex-col relative overflow-hidden">
-          {!imagePreview ? (
-            <div className="flex-1 border-2 border-dashed border-slate-300 rounded-xl flex flex-col items-center justify-center bg-slate-50/50 hover:bg-slate-50 transition-colors cursor-pointer group" onClick={() => fileInputRef.current?.click()}><div className="w-16 h-16 bg-blue-100 text-blue-500 rounded-full flex items-center justify-center mb-4 group-hover:scale-110 transition-transform"><Upload size={32} /></div><h3 className="font-bold text-slate-700">آپلود تصویر پلیت</h3><p className="text-slate-400 text-xs mt-2 text-center max-w-xs">برای شروع آنالیز، عکس پلیت کشت را اینجا رها کنید یا کلیک کنید.</p><input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleFileSelect} /><button className="mt-6 px-4 py-2 bg-white border border-slate-200 text-slate-600 rounded-lg text-sm font-medium shadow-sm flex items-center gap-2"><Camera size={16} />استفاده از دوربین</button></div>
-          ) : (
-            <><div className="flex-1 relative rounded-xl overflow-hidden bg-black flex items-center justify-center"><img src={imagePreview} alt="Petri Dish" className="max-w-full max-h-full object-contain" />{isAnalyzing && (<div className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center backdrop-blur-sm"><div className="w-12 h-12 border-4 border-white border-t-transparent rounded-full animate-spin mb-4"></div><span className="text-white font-medium animate-pulse">در حال آنالیز میکروبی...</span></div>)}</div>{!result && !isAnalyzing && (<div className="mt-4 flex gap-3"><button onClick={startAnalysis} className="flex-1 bg-blue-600 text-white py-3 rounded-xl font-bold hover:bg-blue-700 transition-colors shadow-lg shadow-blue-200 flex items-center justify-center gap-2"><Activity size={20} />شروع پردازش هوشمند</button><button onClick={resetAnalysis} className="px-4 bg-slate-100 text-slate-600 rounded-xl hover:bg-slate-200"><X size={20} /></button></div>)}</>
-          )}
-        </div>
-        <div className="flex flex-col h-full overflow-y-auto space-y-4">
-          {!result ? (
-            <div className="bg-slate-50 border border-slate-200 rounded-2xl h-full flex flex-col items-center justify-center text-center p-8"><div className="w-20 h-20 bg-white rounded-full shadow-sm flex items-center justify-center mb-4 text-slate-300"><FileText size={40} /></div><h3 className="text-lg font-bold text-slate-700 mb-2">منتظر داده‌های آنالیز</h3><p className="text-slate-500 text-sm max-w-sm">پس از آپلود تصویر، هوش مصنوعی کلونی‌ها را شمارش کرده و نتایج آنتی‌بیوگرام را تفسیر می‌کند.</p></div>
-          ) : (
-            <><div className="grid grid-cols-2 gap-4"><div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm"><h4 className="text-xs font-bold text-slate-400 mb-2 uppercase tracking-wider">تشخیص احتمالی</h4><div className="flex items-start gap-3"><div className="bg-indigo-100 p-2 rounded-lg text-indigo-600"><Microscope size={24} /></div><div><div className="font-bold text-slate-800 text-lg leading-tight">{result.organism_suspicion}</div><div className="text-xs text-indigo-600 font-medium mt-1 bg-indigo-50 inline-block px-2 py-0.5 rounded-full">اطمینان: {result.confidence}</div></div></div></div><div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm"><h4 className="text-xs font-bold text-slate-400 mb-2 uppercase tracking-wider">مرحله رشد</h4><div className="flex items-start gap-3"><div className="bg-orange-100 p-2 rounded-lg text-orange-600"><Clock size={24} /></div><div><div className="font-bold text-slate-800 text-lg leading-tight">{result.growth_stage}</div><div className="text-xs text-slate-500 mt-1 line-clamp-1">{result.colony_morphology}</div></div></div></div></div><div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden flex-1"><div className="px-5 py-4 border-b border-slate-100 flex justify-between items-center"><h4 className="font-bold text-slate-800 flex items-center gap-2"><CheckCircle size={18} className="text-green-500" />نتایج آنتی‌بیوگرام (AST)</h4><span className="text-[10px] text-slate-400">استاندارد CLSI</span></div>{result.antibiotic_results.length > 0 ? (<div className="overflow-x-auto"><table className="w-full text-right text-sm"><thead className="bg-slate-50 text-slate-500 font-medium"><tr><th className="px-5 py-3 text-right">آنتی‌بیوتیک</th><th className="px-5 py-3 text-center">قطر هاله (mm)</th><th className="px-5 py-3 text-center">تفسیر</th></tr></thead><tbody className="divide-y divide-slate-100">{result.antibiotic_results.map((ab, idx) => (<tr key={idx} className="hover:bg-slate-50/50"><td className="px-5 py-3 font-medium text-slate-700">{ab.name}</td><td className="px-5 py-3 text-center font-mono text-slate-500">{ab.zone_size_mm}</td><td className="px-5 py-3 text-center"><span className={`px-2 py-1 rounded-full text-xs font-bold ${ab.interpretation === 'Sensitive' ? 'bg-green-100 text-green-700' : ab.interpretation === 'Resistant' ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-700'}`}>{ab.interpretation === 'Sensitive' ? 'حساس (S)' : ab.interpretation === 'Resistant' ? 'مقاوم (R)' : 'بینابینی (I)'}</span></td></tr>))}</tbody></table></div>) : (<div className="p-8 text-center text-slate-400"><p>هیچ دیسک آنتی‌بیوتیکی در تصویر شناسایی نشد.</p></div>)}</div><div className="bg-blue-50 border border-blue-100 rounded-2xl p-4"><h4 className="font-bold text-blue-800 text-sm mb-2 flex items-center gap-2"><Info size={16} />پیشنهاد بالینی هوشمند</h4><p className="text-sm text-blue-700 leading-relaxed text-justify">{result.recommendation}</p></div></>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-};
-
 const SettingsModule = ({ history, onClearHistory, profile, setProfile }: any) => {
-  const [activeTab, setActiveTab] = useState<'profile' | 'history'>('history');
+  const [activeTab, setActiveTab] = useState<'profile' | 'history' | 'keys'>('keys');
+  const [keys, setKeys] = useState<KeyStat[]>([]);
+  const [testingKey, setTestingKey] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (activeTab === 'keys') {
+      setKeys(aiService.getKeyStats());
+      const interval = setInterval(() => {
+        setKeys(aiService.getKeyStats());
+      }, 2000);
+      return () => clearInterval(interval);
+    }
+  }, [activeTab]);
+
+  const testKey = async (index: number) => {
+    setTestingKey(index);
+    await aiService.testKey(index);
+    setKeys(aiService.getKeyStats());
+    setTestingKey(null);
+  };
+
   return (
     <div className="space-y-6">
       <header><h2 className="text-2xl font-bold text-slate-800 flex items-center gap-2"><Settings className="text-slate-600" />تنظیمات و پرونده‌ها</h2><p className="text-slate-500 text-sm mt-1">مدیریت پروفایل کاربری و مشاهده سوابق آزمایشات</p></header>
-      <div className="flex gap-4 border-b border-slate-200"><button onClick={() => setActiveTab('history')} className={`pb-3 px-4 text-sm font-medium transition-colors border-b-2 ${activeTab === 'history' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-700'}`}>تاریخچه آزمایشات ({history.length})</button><button onClick={() => setActiveTab('profile')} className={`pb-3 px-4 text-sm font-medium transition-colors border-b-2 ${activeTab === 'profile' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-700'}`}>پروفایل و سیستم</button></div>
+      <div className="flex gap-4 border-b border-slate-200">
+        <button onClick={() => setActiveTab('keys')} className={`pb-3 px-4 text-sm font-medium transition-colors border-b-2 flex items-center gap-2 ${activeTab === 'keys' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-700'}`}><Key size={16} />مدیریت کلیدها</button>
+        <button onClick={() => setActiveTab('history')} className={`pb-3 px-4 text-sm font-medium transition-colors border-b-2 flex items-center gap-2 ${activeTab === 'history' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-700'}`}><History size={16} />تاریخچه آزمایشات</button>
+        <button onClick={() => setActiveTab('profile')} className={`pb-3 px-4 text-sm font-medium transition-colors border-b-2 flex items-center gap-2 ${activeTab === 'profile' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-700'}`}><User size={16} />پروفایل</button>
+      </div>
       <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm min-h-[400px]">
-        {activeTab === 'history' ? (
+        {activeTab === 'keys' && (
+          <div className="space-y-4">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="font-bold text-slate-700">وضعیت کلیدهای API</h3>
+              <div className="text-xs text-slate-500 bg-slate-100 px-2 py-1 rounded">تعداد کلیدهای شناسایی شده: {keys.length}</div>
+            </div>
+            {keys.length === 0 ? (
+              <div className="text-center py-12 bg-red-50 rounded-xl border border-red-100 text-red-600">
+                <AlertCircle size={48} className="mx-auto mb-2" />
+                <p className="font-bold">هیچ کلیدی یافت نشد!</p>
+                <p className="text-xs mt-1">لطفاً متغیرهای محیطی VITE_GOOGLE_GENAI_TOKEN_n را بررسی کنید.</p>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {keys.map((k) => (
+                  <div key={k.index} className={`flex items-center justify-between p-3 rounded-xl border ${k.status === 'dead' ? 'bg-red-50 border-red-200' : k.status === 'cooldown' ? 'bg-orange-50 border-orange-200' : 'bg-white border-slate-200'}`}>
+                    <div className="flex items-center gap-4">
+                      <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs ${k.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-slate-200 text-slate-500'}`}>{k.index}</div>
+                      <div>
+                        <div className="font-mono text-sm font-bold text-slate-700">{k.mask}</div>
+                        <div className="flex gap-3 text-[10px] text-slate-500 mt-0.5">
+                          <span className="text-green-600">موفق: {k.requests}</span>
+                          <span className="text-red-500">خطا: {k.errors}</span>
+                          {k.lastUsed > 0 && <span>آخرین استفاده: {new Date(k.lastUsed).toLocaleTimeString()}</span>}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <div className={`px-2 py-1 rounded text-xs font-bold ${k.status === 'active' ? 'text-green-600 bg-green-100' : k.status === 'cooldown' ? 'text-orange-600 bg-orange-100' : 'text-red-600 bg-red-100'}`}>
+                        {k.status === 'active' ? 'فعال' : k.status === 'cooldown' ? 'استراحت' : 'غیرفعال'}
+                      </div>
+                      <button 
+                        onClick={() => testKey(k.index)}
+                        disabled={testingKey !== null}
+                        className="p-2 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors disabled:opacity-50"
+                        title="تست اتصال"
+                      >
+                        {testingKey === k.index ? <div className="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div> : <Play size={16} />}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {activeTab === 'history' && (
           <div className="space-y-4"><div className="flex justify-between items-center mb-4"><h3 className="font-bold text-slate-700">آخرین آزمایش‌های انجام شده</h3>{history.length > 0 && (<button onClick={onClearHistory} className="text-xs text-red-500 hover:bg-red-50 px-3 py-1.5 rounded-lg flex items-center gap-1 transition-colors"><Trash2 size={14} />پاکسازی تاریخچه</button>)}</div>{history.length === 0 ? (<div className="text-center py-12 text-slate-400"><History size={48} className="mx-auto mb-3 opacity-20" /><p>هنوز هیچ آزمایشی ثبت نشده است.</p></div>) : (<div className="space-y-3">{history.slice().reverse().map((item: any) => (<div key={item.id} className="flex items-center justify-between p-4 border border-slate-100 rounded-xl hover:bg-slate-50 transition-colors"><div className="flex items-center gap-4"><div className="w-10 h-10 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center"><Microscope size={20} /></div><div><div className="font-bold text-slate-800">{item.organism_suspicion}</div><div className="text-xs text-slate-500">{new Date(item.timestamp).toLocaleDateString('fa-IR')} • {new Date(item.timestamp).toLocaleTimeString('fa-IR', {hour: '2-digit', minute:'2-digit'})}</div></div></div><div className="flex items-center gap-3"><span className="text-xs bg-slate-100 text-slate-600 px-2 py-1 rounded-md">{item.antibiotic_results.length} آنتی‌بیوتیک</span><button className="text-slate-400 hover:text-blue-600"><Download size={18} /></button></div></div>))}</div>)}</div>
-        ) : (
+        )}
+        {activeTab === 'profile' && (
           <div className="max-w-lg space-y-6"><div className="space-y-4"><div><label className="block text-sm font-medium text-slate-700 mb-1">نام پزشک / مسئول</label><div className="relative"><User size={18} className="absolute right-3 top-3 text-slate-400" /><input type="text" value={profile.name} onChange={(e) => setProfile({...profile, name: e.target.value})} className="w-full pr-10 pl-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:outline-none" /></div></div><div><label className="block text-sm font-medium text-slate-700 mb-1">نام آزمایشگاه</label><div className="relative"><FlaskConical size={18} className="absolute right-3 top-3 text-slate-400" /><input type="text" value={profile.labName} onChange={(e) => setProfile({...profile, labName: e.target.value})} className="w-full pr-10 pl-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:outline-none" /></div></div></div><div className="pt-6 border-t border-slate-100"><h4 className="font-bold text-slate-700 mb-4">وضعیت سیستم</h4><div className="space-y-2"><div className="flex items-center justify-between p-3 bg-green-50 rounded-xl border border-green-100"><div className="flex items-center gap-2"><CheckCircle size={18} className="text-green-600" /><span className="text-sm text-green-800">اتصال به Gemini AI</span></div><span className="text-xs font-bold text-green-700">متصل</span></div><div className="flex items-center justify-between p-3 bg-slate-50 rounded-xl border border-slate-100"><div className="flex items-center gap-2"><Video size={18} className="text-slate-500" /><span className="text-sm text-slate-700">دسترسی دوربین</span></div><button className="text-xs text-blue-600 font-medium">تست مجدد</button></div></div></div></div>
         )}
       </div>
@@ -1395,20 +1483,29 @@ const SettingsModule = ({ history, onClearHistory, profile, setProfile }: any) =
 const LabResourcesModule = () => {
   const [mode, setMode] = useState<'calculator' | 'designer'>('designer');
   const [showPreviewModal, setShowPreviewModal] = useState(false);
-  const [calcSourceMg, setCalcSourceMg] = useState(500); 
-  const [calcTargetMcg, setCalcTargetMcg] = useState(10); 
-  const [calcDropUl, setCalcDropUl] = useState(20); 
+  // FIX: Allow string for empty input handling
+  const [calcSourceMg, setCalcSourceMg] = useState<number | ''>(500); 
+  const [calcTargetMcg, setCalcTargetMcg] = useState<number | ''>(10); 
+  const [calcDropUl, setCalcDropUl] = useState<number | ''>(20); 
+  
   const [printQueue, setPrintQueue] = useState<{code: string, name: string}[]>([]);
   const [discShape, setDiscShape] = useState<'circle' | 'square'>('circle');
   const [newDiscName, setNewDiscName] = useState('');
   const [newDiscCode, setNewDiscCode] = useState('');
   const [batchSize, setBatchSize] = useState(50);
+  
   const commonAntibiotics = [{ name: 'Amoxicillin', code: 'AMX' }, { name: 'Ciprofloxacin', code: 'CIP' }, { name: 'Gentamicin', code: 'CN' }, { name: 'Erythromycin', code: 'E' }, { name: 'Tetracycline', code: 'TE' }, { name: 'Vancomycin', code: 'VA' }];
-  const requiredConc = calcTargetMcg / calcDropUl; 
-  const requiredSolvent = calcSourceMg / requiredConc; 
+  
+  const safeSource = Number(calcSourceMg) || 0;
+  const safeTarget = Number(calcTargetMcg) || 0;
+  const safeDrop = Number(calcDropUl) || 0;
+
+  const requiredConc = safeDrop > 0 ? safeTarget / safeDrop : 0; 
+  const requiredSolvent = requiredConc > 0 ? safeSource / requiredConc : 0; 
+  
   const addToQueue = (ab: {name: string, code: string}) => { const newItems = Array(batchSize).fill(ab); setPrintQueue(prev => [...prev, ...newItems]); };
   const handlePrint = () => { window.print(); };
-  const getCalculatorContext = () => { return `Current Calculator State: Source Antibiotic: ${calcSourceMg} mg, Target Disc Potency: ${calcTargetMcg} mcg, Pipette Drop Size: ${calcDropUl} ul, Calculated Required Solvent: ${requiredSolvent.toFixed(2)} ml`; };
+  const getCalculatorContext = () => { return `Current Calculator State: Source Antibiotic: ${safeSource} mg, Target Disc Potency: ${safeTarget} mcg, Pipette Drop Size: ${safeDrop} ul, Calculated Required Solvent: ${requiredSolvent.toFixed(2)} ml`; };
 
   return (
     <div className="space-y-6">
@@ -1425,7 +1522,7 @@ const LabResourcesModule = () => {
       <div className="flex gap-4 border-b border-slate-200 print:hidden"><button onClick={() => setMode('designer')} className={`pb-3 px-4 text-sm font-medium transition-colors border-b-2 flex items-center gap-2 ${mode === 'designer' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-700'}`}><Grid size={16} />طراحی و چاپ دیسک</button><button onClick={() => setMode('calculator')} className={`pb-3 px-4 text-sm font-medium transition-colors border-b-2 flex items-center gap-2 ${mode === 'calculator' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-700'}`}><Calculator size={16} />محاسبه دوز محلول</button></div>
       {mode === 'calculator' ? (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 print:hidden">
-          <div className="space-y-6"><div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6"><h3 className="font-bold text-slate-700 border-b border-slate-100 pb-2">ورودی‌ها</h3><div><label className="block text-sm font-medium text-slate-600 mb-1">وزن قرص/کپسول منبع (mg)</label><div className="relative"><input type="number" value={calcSourceMg} onChange={e => setCalcSourceMg(Number(e.target.value))} className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl" /><span className="absolute left-3 top-3 text-slate-400 text-sm">میلی‌گرم</span></div></div><div><label className="block text-sm font-medium text-slate-600 mb-1">قدرت دیسک هدف (mcg)</label><div className="relative"><input type="number" value={calcTargetMcg} onChange={e => setCalcTargetMcg(Number(e.target.value))} className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl" /><span className="absolute left-3 top-3 text-slate-400 text-sm">میکروگرم</span></div><p className="text-xs text-slate-400 mt-1">استاندارد معمول: ۱۰ یا ۳۰ میکروگرم</p></div><div><label className="block text-sm font-medium text-slate-600 mb-1">حجم قطره پیپت شما (ul)</label><div className="relative"><input type="number" value={calcDropUl} onChange={e => setCalcDropUl(Number(e.target.value))} className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl" /><span className="absolute left-3 top-3 text-slate-400 text-sm">میکرولیتر</span></div></div></div><div className="bg-blue-600 text-white p-6 rounded-2xl shadow-lg flex flex-col justify-center relative overflow-hidden"><div className="absolute top-0 right-0 w-32 h-32 bg-white opacity-5 rounded-full -mr-10 -mt-10"></div><h3 className="text-lg font-bold mb-6 flex items-center gap-2"><FlaskConical />دستورالعمل ساخت محلول</h3><div className="space-y-6 relative z-10"><div className="bg-white/10 p-4 rounded-xl backdrop-blur-sm"><span className="text-blue-100 text-xs uppercase block mb-1">غلظت مورد نیاز</span><span className="text-2xl font-black">{requiredConc.toFixed(2)} mg/ml</span></div><div className="bg-white text-blue-900 p-5 rounded-xl shadow-md"><span className="text-blue-600 text-xs font-bold uppercase block mb-2">دستور نهایی</span><p className="font-medium leading-relaxed">محتوای کپسول <span className="font-bold">{calcSourceMg} میلی‌گرمی</span> را در <span className="font-black text-xl mx-1 text-blue-700">{requiredSolvent.toFixed(1)}</span>میلی‌لیتر آب مقطر استریل حل کنید.</p></div></div></div></div>
+          <div className="space-y-6"><div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6"><h3 className="font-bold text-slate-700 border-b border-slate-100 pb-2">ورودی‌ها</h3><div><label className="block text-sm font-medium text-slate-600 mb-1">وزن قرص/کپسول منبع (mg)</label><div className="relative"><input type="number" value={calcSourceMg} onChange={e => setCalcSourceMg(e.target.value === '' ? '' : Number(e.target.value))} className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl" /><span className="absolute left-3 top-3 text-slate-400 text-sm">میلی‌گرم</span></div></div><div><label className="block text-sm font-medium text-slate-600 mb-1">قدرت دیسک هدف (mcg)</label><div className="relative"><input type="number" value={calcTargetMcg} onChange={e => setCalcTargetMcg(e.target.value === '' ? '' : Number(e.target.value))} className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl" /><span className="absolute left-3 top-3 text-slate-400 text-sm">میکروگرم</span></div><p className="text-xs text-slate-400 mt-1">استاندارد معمول: ۱۰ یا ۳۰ میکروگرم</p></div><div><label className="block text-sm font-medium text-slate-600 mb-1">حجم قطره پیپت شما (ul)</label><div className="relative"><input type="number" value={calcDropUl} onChange={e => setCalcDropUl(e.target.value === '' ? '' : Number(e.target.value))} className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl" /><span className="absolute left-3 top-3 text-slate-400 text-sm">میکرولیتر</span></div></div></div><div className="bg-blue-600 text-white p-6 rounded-2xl shadow-lg flex flex-col justify-center relative overflow-hidden"><div className="absolute top-0 right-0 w-32 h-32 bg-white opacity-5 rounded-full -mr-10 -mt-10"></div><h3 className="text-lg font-bold mb-6 flex items-center gap-2"><FlaskConical />دستورالعمل ساخت محلول</h3><div className="space-y-6 relative z-10"><div className="bg-white/10 p-4 rounded-xl backdrop-blur-sm"><span className="text-blue-100 text-xs uppercase block mb-1">غلظت مورد نیاز</span><span className="text-2xl font-black">{requiredConc.toFixed(2)} mg/ml</span></div><div className="bg-white text-blue-900 p-5 rounded-xl shadow-md"><span className="text-blue-600 text-xs font-bold uppercase block mb-2">دستور نهایی</span><p className="font-medium leading-relaxed">محتوای کپسول <span className="font-bold">{safeSource} میلی‌گرمی</span> را در <span className="font-black text-xl mx-1 text-blue-700">{requiredSolvent.toFixed(1)}</span>میلی‌لیتر آب مقطر استریل حل کنید.</p></div></div></div></div>
           <div className="space-y-4"><div className="bg-indigo-50 border border-indigo-100 p-4 rounded-2xl"><div className="flex items-start gap-3"><div className="bg-indigo-100 p-2 rounded-lg text-indigo-600"><Info size={24} /></div><div><h4 className="font-bold text-indigo-900">مشاوره فنی و کنترل کیفیت</h4><p className="text-sm text-indigo-700 mt-1">سوالات خود را در مورد نحوه استریل کردن، خشک کردن دیسک‌ها و شرایط نگهداری از کارشناس هوشمند بپرسید.</p></div></div></div><LiveVoiceAssistant initialContext={getCalculatorContext()} persona="qc" /></div>
         </div>
       ) : (
