@@ -143,14 +143,103 @@ function floatTo16BitPCM(input: Float32Array): Int16Array {
   return output;
 }
 
-// --- AI SERVICE ---
+// --- AI SERVICE WITH MULTI-KEY LOAD BALANCING ---
 
 class LabAIService {
-  public ai: GoogleGenAI;
   private modelName = 'gemini-2.5-flash';
+  private apiKeys: string[] = [];
+  private currentKeyIndex = 0;
 
   constructor() {
-    this.ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    this.harvestKeys();
+  }
+
+  /**
+   * Automatically discovers keys starting from VITE_API_KEY_1 up to infinity.
+   */
+  private harvestKeys() {
+    let index = 1;
+    while (true) {
+      // Try to find VITE_API_KEY_n in process.env
+      // Note: In some bundlers, dynamic access to process.env might be restricted.
+      // We rely on standard exposing. If using Vite, import.meta.env is preferred but
+      // we stick to process.env as per previous config or fallback.
+      const keyName = `VITE_API_KEY_${index}`;
+      const key = process.env[keyName];
+
+      if (key) {
+        this.apiKeys.push(key);
+        index++;
+      } else {
+        // Stop when we hit a missing number
+        break;
+      }
+    }
+
+    // Fallback: If no numbered keys found, try standard API_KEY
+    if (this.apiKeys.length === 0) {
+      const singleKey = process.env.API_KEY;
+      if (singleKey) {
+        this.apiKeys.push(singleKey);
+      } else {
+        console.warn("No API Keys found! Please set VITE_API_KEY_1, VITE_API_KEY_2, etc.");
+        // Add a dummy key to prevent immediate crash, allow UI to load
+        this.apiKeys.push("MISSING_KEYS");
+      }
+    }
+
+    console.log(`LabAIService initialized with ${this.apiKeys.length} keys.`);
+  }
+
+  /**
+   * Returns a client using the next key in rotation.
+   * Useful for Live API connections which need a single stable client.
+   */
+  getLiveClient(): GoogleGenAI {
+    const key = this.getNextKey();
+    return new GoogleGenAI({ apiKey: key });
+  }
+
+  private getNextKey(): string {
+    const key = this.apiKeys[this.currentKeyIndex];
+    // Round-robin rotation
+    this.currentKeyIndex = (this.currentKeyIndex + 1) % this.apiKeys.length;
+    return key;
+  }
+
+  /**
+   * Executes an AI operation with automatic failover.
+   * If a key fails with 429/403, it switches to the next key and retries.
+   */
+  private async executeWithRetry<T>(operation: (ai: GoogleGenAI) => Promise<T>): Promise<T> {
+    let attempts = 0;
+    // Try at most 2 full cycles of keys to avoid infinite loops
+    const maxAttempts = this.apiKeys.length * 2; 
+
+    while (attempts < maxAttempts) {
+      const currentKey = this.getNextKey();
+      
+      try {
+        const ai = new GoogleGenAI({ apiKey: currentKey });
+        return await operation(ai);
+      } catch (error: any) {
+        console.warn(`Request failed with key ending in ...${currentKey.slice(-4)}:`, error.message);
+
+        // Check for specific errors that warrant a retry (Quota or Permission)
+        const isQuotaError = error.message?.includes('429') || error.status === 429;
+        const isAuthError = error.message?.includes('403') || error.status === 403; // Key might be invalid/blocked
+
+        if (isQuotaError || isAuthError) {
+          console.log("Switching to next key due to quota/auth limit...");
+          attempts++;
+          continue; // Retry loop with next key
+        }
+        
+        // For other errors (e.g., 400 Bad Request), throw immediately
+        throw error;
+      }
+    }
+    throw new Error("All API keys exhausted or service unavailable.");
   }
 
   async clinicalDiagnosis(
@@ -158,7 +247,7 @@ class LabAIService {
     history: string, 
     images: string[]
   ): Promise<ClinicalDiagnosisResult | null> {
-    try {
+    return this.executeWithRetry(async (ai) => {
       // Build Vitals String
       let vitalsStr = "Vital Signs: ";
       if (vitals.temp.enabled) vitalsStr += `Temp: ${vitals.temp.value}°C, `;
@@ -192,35 +281,30 @@ class LabAIService {
         }` }
       ];
 
-      // Add images if any
       for (const img of images) {
         promptParts.push({ inlineData: { mimeType: "image/jpeg", data: img } });
       }
 
-      const response = await this.ai.models.generateContent({
+      const response = await ai.models.generateContent({
         model: this.modelName,
         contents: promptParts,
         config: { responseMimeType: 'application/json' }
       });
 
       return JSON.parse(response.text || '{}') as ClinicalDiagnosisResult;
-    } catch (error) {
-      console.error("Diagnosis Error:", error);
+    }).catch(err => {
+      console.error("Diagnosis Final Error:", err);
+      alert("خطا در ارتباط با هوش مصنوعی. لطفاً اتصال اینترنت یا کلیدها را بررسی کنید.");
       return null;
-    }
+    });
   }
 
   async analyzePlateImage(base64Image: string): Promise<AnalysisResult | null> {
-    try {
-      const response = await this.ai.models.generateContent({
+    return this.executeWithRetry(async (ai) => {
+      const response = await ai.models.generateContent({
         model: this.modelName,
         contents: [
-          {
-            inlineData: {
-              mimeType: "image/jpeg",
-              data: base64Image
-            }
-          },
+          { inlineData: { mimeType: "image/jpeg", data: base64Image } },
           {
             text: `Analyze this microbiology petri dish image carefully. You are an expert microbiologist.
             Identify colonies, morphology, and if antibiotic discs are present, estimate the Zone of Inhibition.
@@ -250,10 +334,10 @@ class LabAIService {
         id: crypto.randomUUID(),
         timestamp: Date.now()
       } as AnalysisResult;
-    } catch (error) {
-      console.error("Analysis Error:", error);
+    }).catch(err => {
+      console.error("Analysis Final Error:", err);
       return null;
-    }
+    });
   }
 }
 
@@ -311,8 +395,7 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
   useEffect(scrollToBottom, [messages]);
 
   const initAudioContext = () => {
-    // If context exists and is closed, we must create a new one. 
-    // If it is running or suspended, we can reuse or resume.
+    // Reuse existing context if running to prevent "limit reached" error
     if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
         sampleRate: AUDIO_OUTPUT_SAMPLE_RATE,
@@ -322,6 +405,7 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
     if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume();
     }
+    return audioContextRef.current;
   };
 
   const stopAllAudio = () => {
@@ -340,7 +424,7 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
   const connect = async () => {
     try {
       setIsConnecting(true);
-      initAudioContext();
+      const ctx = initAudioContext();
       
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -375,7 +459,10 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
           هدف: راهنمایی برای ساخت دیسک آنتی‌بیوتیک و استریلیزاسیون.`;
       }
 
-      const sessionPromise = aiService.ai.live.connect({
+      // GET FRESH CLIENT FOR LOAD BALANCING
+      const aiClient = aiService.getLiveClient();
+
+      const sessionPromise = aiClient.live.connect({
         model: model,
         config: {
           responseModalities: [Modality.AUDIO],
@@ -396,7 +483,6 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
             });
 
             // Use the single persisted AudioContext
-            const ctx = audioContextRef.current!;
             const source = ctx.createMediaStreamSource(stream);
             // Revert buffer size to 4096 for stability
             const processor = ctx.createScriptProcessor(4096, 1, 1);
@@ -515,8 +601,8 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
       sourceRef.current.disconnect();
       sourceRef.current = null;
     }
-    // 3. Close Audio Context (Crucial for Resource Leak)
-    if (audioContextRef.current) {
+    // 3. Strictly Close Audio Context
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
       audioContextRef.current.close().catch(e => console.error(e));
       audioContextRef.current = null;
     }
@@ -1021,6 +1107,7 @@ const LiveLabModule = () => {
   const nextStartTimeRef = useRef<number>(0);
   const audioQueueRef = useRef<AudioBufferSourceNode[]>([]);
   const frameIntervalRef = useRef<number | null>(null);
+  const sessionRef = useRef<any>(null);
   
   const prevFrameDataRef = useRef<Uint8ClampedArray | null>(null);
   const lastSendTimeRef = useRef<number>(0);
@@ -1052,6 +1139,7 @@ const LiveLabModule = () => {
     if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume();
     }
+    return audioContextRef.current;
   };
 
   const startLocalStream = async () => {
@@ -1078,7 +1166,7 @@ const LiveLabModule = () => {
   };
 
   const connectToGemini = async () => {
-    initAudioContext();
+    const ctx = initAudioContext();
     const stream = await startLocalStream();
     if (!stream) return;
 
@@ -1088,7 +1176,10 @@ const LiveLabModule = () => {
     try {
       const model = 'gemini-2.5-flash-native-audio-preview-09-2025'; 
       
-      const sessionPromise = aiService.ai.live.connect({
+      // GET FRESH CLIENT FOR LOAD BALANCING
+      const aiClient = aiService.getLiveClient();
+
+      const sessionPromise = aiClient.live.connect({
         model: model,
         config: {
           responseModalities: [Modality.AUDIO],
@@ -1105,7 +1196,10 @@ const LiveLabModule = () => {
           onopen: () => {
             setStatus('connected');
             
-            const ctx = audioContextRef.current!;
+            sessionPromise.then(s => {
+              sessionRef.current = s;
+            });
+
             const source = ctx.createMediaStreamSource(stream);
             const processor = ctx.createScriptProcessor(4096, 1, 1);
             
@@ -1262,8 +1356,8 @@ const LiveLabModule = () => {
       sourceRef.current = null;
     }
 
-    // 3. Close Context to free hardware resources
-    if (audioContextRef.current) {
+    // 3. Strictly Close Audio Context
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
       audioContextRef.current.close().catch(e => console.error(e));
       audioContextRef.current = null;
     }
@@ -1275,6 +1369,7 @@ const LiveLabModule = () => {
     audioQueueRef.current.forEach(source => source.stop());
     audioQueueRef.current = [];
     nextStartTimeRef.current = 0;
+    sessionRef.current = null;
   };
 
   useEffect(() => {
