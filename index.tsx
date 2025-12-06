@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef, createContext, useContext, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Modality } from "@google/genai";
@@ -157,33 +158,42 @@ class KeyManager {
   private scanKeys() {
     const foundKeys: string[] = [];
     
-    // 1. Add Primary Key
-    if (process.env.API_KEY) foundKeys.push(process.env.API_KEY);
+    // 1. Add Primary Key (Safe check for process.env)
+    // Note: In Vite, process.env might not be fully populated in the browser, 
+    // but we check it just in case a define plugin is used.
+    try {
+      if (typeof process !== 'undefined' && process.env && process.env.API_KEY) {
+        foundKeys.push(process.env.API_KEY);
+      }
+    } catch (e) {
+      // Ignore process access errors
+    }
 
-    // 2. Scan VITE_GOOGLE_GENAI_TOKEN_1 to 20 (Environment Variables)
-    // NOTE: Build tools like Vite requires explicit usage of process.env.VAR_NAME to replace them at build time.
-    // Dynamic access like process.env['VAR_' + i] will result in undefined in production builds.
+    // 2. Scan VITE_GOOGLE_GENAI_TOKEN_1 to 20 using import.meta.env (Correct for Vite/Vercel)
+    // We must list them explicitly for static analysis by the bundler.
+    const env = import.meta.env;
+
     const potentialKeys = [
-      process.env.VITE_GOOGLE_GENAI_TOKEN_1,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_2,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_3,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_4,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_5,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_6,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_7,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_8,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_9,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_10,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_11,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_12,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_13,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_14,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_15,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_16,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_17,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_18,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_19,
-      process.env.VITE_GOOGLE_GENAI_TOKEN_20,
+      env.VITE_GOOGLE_GENAI_TOKEN_1,
+      env.VITE_GOOGLE_GENAI_TOKEN_2,
+      env.VITE_GOOGLE_GENAI_TOKEN_3,
+      env.VITE_GOOGLE_GENAI_TOKEN_4,
+      env.VITE_GOOGLE_GENAI_TOKEN_5,
+      env.VITE_GOOGLE_GENAI_TOKEN_6,
+      env.VITE_GOOGLE_GENAI_TOKEN_7,
+      env.VITE_GOOGLE_GENAI_TOKEN_8,
+      env.VITE_GOOGLE_GENAI_TOKEN_9,
+      env.VITE_GOOGLE_GENAI_TOKEN_10,
+      env.VITE_GOOGLE_GENAI_TOKEN_11,
+      env.VITE_GOOGLE_GENAI_TOKEN_12,
+      env.VITE_GOOGLE_GENAI_TOKEN_13,
+      env.VITE_GOOGLE_GENAI_TOKEN_14,
+      env.VITE_GOOGLE_GENAI_TOKEN_15,
+      env.VITE_GOOGLE_GENAI_TOKEN_16,
+      env.VITE_GOOGLE_GENAI_TOKEN_17,
+      env.VITE_GOOGLE_GENAI_TOKEN_18,
+      env.VITE_GOOGLE_GENAI_TOKEN_19,
+      env.VITE_GOOGLE_GENAI_TOKEN_20,
     ];
 
     potentialKeys.forEach(k => {
@@ -426,7 +436,7 @@ const LiveVoiceAssistant = ({ initialContext, persona = 'clinical' }: { initialC
   const [messages, setMessages] = useState<Message[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   
-  // Audio Refs
+  // Audio Refs - Use ONE shared AudioContext for Input and Output to prevent leaks
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -1135,8 +1145,6 @@ const LiveLabModule = () => {
     </div>
   );
 };
-
-// ... [The rest of the file stays same until the end] ...
 
 const ClinicalConsoleModule = () => {
   // State for Inputs
