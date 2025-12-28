@@ -1,4 +1,3 @@
-
 import React, { createContext, useContext, ReactNode, useState, useEffect, useCallback } from 'react';
 import type {
     Product, ProductBatch, SaleInvoice, PurchaseInvoice, PurchaseInvoiceItem, InvoiceItem,
@@ -74,7 +73,6 @@ interface AppContextType extends AppState {
     addEmployee: (employee: Omit<Employee, 'id'|'balance'>) => void;
     addEmployeeAdvance: (employeeId: string, amount: number) => void;
     processAndPaySalaries: () => { success: boolean; message: string };
-    // FIX: Renamed addEmployeeExpense to addExpense to match component usage
     addExpense: (expense: Omit<Expense, 'id'>) => void;
 }
 
@@ -146,7 +144,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             let isAuth = false;
             let restoredUser = null;
 
-            // 1. Check for Admin Session (Online)
             if (session?.user) {
                 const profile = await api.getProfile(session.user.id);
                 const deviceId = getDeviceId();
@@ -155,22 +152,25 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
                     if (!profile.current_device_id || profile.current_device_id === deviceId) {
                         isAuth = true;
                         restoredUser = { id: session.user.id, username: session.user.email || 'Admin', roleId: 'admin-role' };
+                        
+                        // Critical check: Attempt to bind device if empty
                         if (!profile.current_device_id) {
-                            await api.updateProfile(session.user.id, { current_device_id: deviceId });
+                            const success = await api.updateProfile(session.user.id, { current_device_id: deviceId });
+                            if (!success) {
+                                isAuth = false; // Kick out if DB cannot record device
+                                await logout();
+                            }
                         }
                     }
                 } else if (!navigator.onLine && localStorage.getItem('ketabestan_offline_auth') === 'true') {
                     isAuth = true;
                     restoredUser = { id: session.user.id, username: session.user.email || 'Admin', roleId: 'admin-role' };
                 }
-            } 
-            // 2. Check for Staff Session (Local Persistence)
-            else {
+            } else {
                 const localStaff = localStorage.getItem('ketabestan_staff_user');
                 if (localStaff) {
                     try {
                         const parsedStaff = JSON.parse(localStaff) as User;
-                        // Verify the user still exists in DB
                         const dbUser = users.find(u => u.id === parsedStaff.id);
                         if (dbUser) {
                             isAuth = true;
@@ -205,7 +205,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             }));
         } catch (error) {
             console.error("Error fetching data:", error);
-            showToast("⚠️ خطا در دریافت اطلاعات.");
+            showToast("⚠️ خطا در دریافت اطلاعات ثانویه.");
         } finally {
             setIsLoading(false);
         }
@@ -228,17 +228,25 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
                 const deviceId = getDeviceId();
                 if (profile.current_device_id && profile.current_device_id !== deviceId) {
-                    return { success: false, message: 'این حساب در دستگاه دیگری فعال است.', locked: true };
+                    return { success: false, message: 'این حساب در دستگاه دیگری فعال است. ابتدا از آن خارج شوید.', locked: true };
                 }
 
-                if (!profile.current_device_id) await api.updateProfile(data.user.id, { current_device_id: deviceId });
+                // Strict Binding during Login
+                if (!profile.current_device_id) {
+                    const success = await api.updateProfile(data.user.id, { current_device_id: deviceId });
+                    if (!success) {
+                        await supabase.auth.signOut();
+                        return { success: false, message: 'خطا در ثبت هویت دستگاه. لطفاً با ادمین دیتابیس تماس بگیرید.' };
+                    }
+                }
 
                 localStorage.setItem('ketabestan_offline_auth', 'true');
                 await fetchData();
-                return { success: true, message: '✅ ورود موفق مدیر' };
-            } catch (e) { return { success: false, message: '❌ خطا در اتصال.' }; }
+                return { success: true, message: '✅ ورود موفق' };
+            } catch (e) {
+                return { success: false, message: '❌ خطا در اتصال به سرور.' };
+            }
         } else {
-            // Staff Login (Local)
             const user = await api.verifyStaffCredentials(identifier, password);
             if (user) {
                 localStorage.setItem('ketabestan_staff_user', JSON.stringify(user));
@@ -252,7 +260,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     const signup = async (email: string, password: string): Promise<{ success: boolean; message: string }> => {
         try {
-            const { error } = await supabase.auth.signup({ email, password });
+            const { error } = await supabase.auth.signUp({ email, password });
             if (error) return { success: false, message: error.message };
             return { success: true, message: '✅ ثبت‌نام انجام شد. لطفاً ایمیل خود را تایید کنید.' };
         } catch (e) {
@@ -261,7 +269,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
 
     const logout = async (): Promise<{ success: boolean; message: string }> => {
-        // If it was a staff login, just clear local session
         const localStaff = localStorage.getItem('ketabestan_staff_user');
         if (localStaff) {
             localStorage.removeItem('ketabestan_staff_user');
@@ -269,9 +276,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             return { success: true, message: 'خروج موفق' };
         }
 
-        // Admin logout needs online connection to clear device lock
         if (!navigator.onLine) {
-            showToast("⚠️ خروج مدیر نیاز به اینترنت دارد.");
+            showToast("⚠️ برای خروج باید به اینترنت متصل باشید.");
             return { success: false, message: 'عدم اتصال به اینترنت' };
         }
 
@@ -688,9 +694,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const addSupplier = (s: any, initialBalance?: any) => api.addSupplier(s).then(newS => { if (initialBalance) api.processPayment('supplier', newS.id, initialBalance.amount, { id: crypto.randomUUID(), supplierId: newS.id, type: 'purchase', amount: initialBalance.amount, date: new Date().toISOString(), description: 'تراز اول' }).then(() => fetchData()); else fetchData(); });
     const deleteSupplier = (id: string) => api.deleteSupplier(id).then(() => fetchData());
     const addCustomer = (c: any, initialBalance?: any) => api.addCustomer(c).then(newC => { if (initialBalance) api.processPayment('customer', newC.id, initialBalance.amount, { id: crypto.randomUUID(), customerId: newC.id, type: 'credit_sale', amount: initialBalance.amount, date: new Date().toISOString(), description: 'تراز اول' }).then(() => fetchData()); else fetchData(); });
+    // FIX: Use api.deleteCustomer instead of direct db access which was causing import errors.
     const deleteCustomer = (id: string) => api.deleteCustomer(id).then(() => fetchData());
     const addEmployee = (e: any) => api.addEmployee(e).then(() => fetchData());
-    // FIX: Renamed internal implementation or mapping to avoid name mismatch
     const addExpense = (e: any) => api.addExpense(e).then(() => fetchData());
     const addSupplierPayment = (supplierId: string, amount: number, description: string, currency: any, rate: any) => {
         const supplier = state.suppliers.find(s => s.id === supplierId)!;
@@ -699,7 +705,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         return tx;
     };
     const addCustomerPayment = (customerId: string, amount: number, description: string) => {
-        const customer = state.customers.find(c => i.id === customerId)!;
+        const customer = state.customers.find(c => c.id === customerId)!;
         const tx = { id: crypto.randomUUID(), customerId, type: 'payment' as const, amount, date: new Date().toISOString(), description };
         api.processPayment('customer', customerId, customer.balance - amount, tx).then(() => fetchData());
         return tx;

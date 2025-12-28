@@ -49,12 +49,17 @@ export const api = {
             return null;
         }
     },
-    updateProfile: async (userId: string, updates: Partial<AdminProfile>) => {
+    updateProfile: async (userId: string, updates: Partial<AdminProfile>): Promise<boolean> => {
         try {
             const { error } = await supabase.from('profiles').update(updates).eq('id', userId);
-            if (error) throw error;
+            if (error) {
+                console.error("Supabase update error:", error);
+                return false;
+            }
+            return true;
         } catch (e) {
             console.error("Profile update failed:", e);
+            return false;
         }
     },
     
