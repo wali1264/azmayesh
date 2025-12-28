@@ -1,7 +1,8 @@
+
 import React, { useState, useRef } from 'react';
 import { useAppContext } from '../AppContext';
 import type { StoreSettings, Service, Role, User, Permission } from '../types';
-import { PlusIcon, TrashIcon, DownloadIcon, UploadIcon, UserGroupIcon, KeyIcon, WarningIcon } from '../components/icons';
+import { PlusIcon, TrashIcon, DownloadIcon, UploadIcon, UserGroupIcon, KeyIcon, WarningIcon, CheckIcon } from '../components/icons';
 import Toast from '../components/Toast';
 import { formatCurrency } from '../utils/formatters';
 import { ALL_PERMISSIONS, groupPermissions } from '../utils/permissions';
@@ -135,8 +136,13 @@ const ServicesTab: React.FC<TabProps> = ({ showToast }) => {
     );
 };
 
-const BackupRestoreTab: React.FC = () => {
-    const { exportData, importData } = useAppContext();
+const BackupRestoreTab: React.FC<TabProps> = ({ showToast }) => {
+    const { 
+        exportData, importData, cloudBackup, cloudRestore, 
+        autoBackupEnabled, setAutoBackupEnabled, currentUser 
+    } = useAppContext();
+    
+    const [isProcessing, setIsProcessing] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     const handleImportClick = () => {
@@ -148,28 +154,98 @@ const BackupRestoreTab: React.FC = () => {
         if (file) {
             importData(file);
         }
-        event.target.value = ''; // Reset input
+        event.target.value = '';
+    };
+
+    const handleCloudBackup = async () => {
+        setIsProcessing(true);
+        await cloudBackup();
+        setIsProcessing(false);
+    };
+
+    const handleCloudRestore = async () => {
+        setIsProcessing(true);
+        await cloudRestore();
+        setIsProcessing(false);
     };
 
     return (
-        <div className="space-y-6 max-w-2xl mx-auto">
-            <h3 className="text-xl font-bold text-slate-800 border-b pb-3 mb-4">پشتیبان‌گیری و بازیابی</h3>
-            <div className="p-4 bg-blue-50/70 border-l-4 border-blue-500 rounded-r-lg">
-                <p className="text-blue-800">از اطلاعات خود به صورت منظم نسخه پشتیبان تهیه کنید تا در صورت بروز مشکل، بتوانید آن را بازیابی نمایید.</p>
+        <div className="space-y-10 max-w-4xl mx-auto">
+            {/* Local Section */}
+            <div className="bg-white/80 p-6 rounded-2xl shadow-lg border border-slate-200">
+                <h3 className="text-xl font-bold text-slate-800 mb-4 flex items-center gap-2">
+                    <DownloadIcon className="w-6 h-6 text-blue-600" />
+                    پشتیبان‌گیری محلی (Local Backup)
+                </h3>
+                <p className="text-sm text-slate-600 mb-6 leading-relaxed">این گزینه یک فایل حاوی تمام اطلاعات فروشگاه شما در کامپیوتر دانلود می‌کند. برای بازیابی اطلاعات در آینده از همین فایل استفاده کنید.</p>
+                
+                <div className="flex flex-wrap gap-4">
+                    <button onClick={exportData} className="flex items-center gap-2 px-6 py-3 rounded-xl bg-blue-600 text-white font-bold hover:bg-blue-700 transition-all shadow-md active:scale-95">
+                        <DownloadIcon />
+                        دانلود فایل پشتیبان
+                    </button>
+                    <button onClick={handleImportClick} className="flex items-center gap-2 px-6 py-3 rounded-xl bg-slate-200 text-slate-700 font-bold hover:bg-slate-300 transition-all shadow-md active:scale-95">
+                        <UploadIcon />
+                        بازیابی از فایل
+                    </button>
+                    <input type="file" accept=".json" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
+                </div>
             </div>
-            <div className="flex justify-center gap-6">
-                 <button onClick={exportData} className="flex items-center gap-2 px-8 py-4 rounded-lg bg-green-600 text-white btn-primary text-lg font-semibold hover:!shadow-green-500/30">
-                    <DownloadIcon />
-                    تهیه نسخه پشتیبان
-                </button>
-                 <button onClick={handleImportClick} className="flex items-center gap-2 px-8 py-4 rounded-lg bg-amber-500 text-white btn-primary text-lg font-semibold hover:!shadow-amber-500/30">
-                    <UploadIcon />
-                    بازیابی از پشتیبان
-                </button>
-                <input type="file" accept=".json" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
+
+            {/* Cloud Section */}
+            <div className="bg-gradient-to-br from-blue-50 to-white p-6 rounded-2xl shadow-lg border border-blue-200">
+                <div className="flex justify-between items-start mb-4">
+                    <h3 className="text-xl font-bold text-blue-800 flex items-center gap-2">
+                        <UploadIcon className="w-6 h-6 text-blue-600" />
+                        پشتیبان‌گیری آنلاین (Cloud Backup)
+                    </h3>
+                    <div className="flex items-center gap-2">
+                         <span className={`text-xs px-2 py-1 rounded-full font-bold ${navigator.onLine ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                            {navigator.onLine ? 'متصل به ابر' : 'عدم اتصال به اینترنت'}
+                        </span>
+                    </div>
+                </div>
+                <p className="text-sm text-slate-600 mb-6 leading-relaxed">اطلاعات شما را در سرور مرکزی ذخیره می‌کند تا از هر دستگاهی به آن دسترسی داشته باشید. نسخه جدید جایگزین نسخه قبلی خواهد شد.</p>
+                
+                <div className="flex flex-wrap gap-4">
+                    <button 
+                        onClick={handleCloudBackup} 
+                        disabled={isProcessing || !navigator.onLine}
+                        className="flex items-center gap-2 px-6 py-3 rounded-xl bg-indigo-600 text-white font-bold hover:bg-indigo-700 transition-all shadow-md active:scale-95 disabled:bg-slate-400"
+                    >
+                        {isProcessing ? 'درحال انجام...' : 'ذخیره در ابر (Online Save)'}
+                    </button>
+                    <button 
+                        onClick={handleCloudRestore}
+                        disabled={isProcessing || !navigator.onLine}
+                        className="flex items-center gap-2 px-6 py-3 rounded-xl bg-white border-2 border-indigo-600 text-indigo-600 font-bold hover:bg-indigo-50 transition-all shadow-md active:scale-95 disabled:border-slate-300 disabled:text-slate-400"
+                    >
+                        بازیابی از ابر (Online Restore)
+                    </button>
+                </div>
+
+                <div className="mt-8 pt-6 border-t border-blue-200 flex flex-col md:flex-row items-center justify-between gap-4">
+                    <div className="flex items-center gap-4">
+                         <div className={`w-14 h-8 rounded-full p-1 cursor-pointer transition-all duration-300 ${autoBackupEnabled ? 'bg-green-500' : 'bg-slate-300'}`} onClick={() => setAutoBackupEnabled(!autoBackupEnabled)}>
+                            <div className={`bg-white w-6 h-6 rounded-full shadow-md transition-all duration-300 ${autoBackupEnabled ? 'mr-6' : 'mr-0'}`}></div>
+                        </div>
+                        <div>
+                            <p className="font-bold text-slate-800">پشتیبان‌گیری هوشمند ۲۴ ساعته</p>
+                            <p className="text-xs text-slate-500">هر ۲۴ ساعت یک نسخه در ابر و یک نسخه در کامپیوتر ذخیره می‌شود.</p>
+                        </div>
+                    </div>
+                    {autoBackupEnabled && (
+                        <div className="flex items-center gap-2 text-green-600 font-bold text-sm bg-green-50 px-3 py-1.5 rounded-lg border border-green-200">
+                            <CheckIcon className="w-4 h-4" />
+                            فعال است
+                        </div>
+                    )}
+                </div>
             </div>
-             <div className="p-4 bg-red-50/70 border-l-4 border-red-500 rounded-r-lg">
-                <p className="font-bold text-red-800">توجه: بازیابی اطلاعات، تمام داده‌های فعلی شما را پاک کرده و اطلاعات فایل پشتیبان را جایگزین آن می‌کند. این عمل غیرقابل بازگشت است.</p>
+
+             <div className="p-4 bg-red-50 border-r-4 border-red-500 rounded-l-lg flex gap-3">
+                <WarningIcon className="w-6 h-6 text-red-600 shrink-0" />
+                <p className="text-sm font-bold text-red-800 leading-relaxed">توجه امنیتی: بازیابی اطلاعات (چه از ابر و چه از فایل) تمام داده‌های فعلی برنامه را پاک کرده و نسخه پشتیبان را جایگزین می‌کند. لطفاً قبل از بازیابی، یک نسخه از اطلاعات فعلی خود ذخیره کنید.</p>
             </div>
         </div>
     );
@@ -357,7 +433,7 @@ const Settings: React.FC = () => {
             case 'storeDetails': return <StoreDetailsTab showToast={showToast} />;
             case 'alerts': return <AlertsTab showToast={showToast} />;
             case 'services': return <ServicesTab showToast={showToast} />;
-            case 'backup': return <BackupRestoreTab />;
+            case 'backup': return <BackupRestoreTab showToast={showToast} />;
             case 'usersAndRoles': return <UsersAndRolesTab showToast={showToast} />;
             default: return <StoreDetailsTab showToast={showToast} />;
         }

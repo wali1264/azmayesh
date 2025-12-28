@@ -62,6 +62,29 @@ export const api = {
             return false;
         }
     },
+
+    // --- CLOUD BACKUP (New Feature) ---
+    saveCloudBackup: async (userId: string, appState: any): Promise<boolean> => {
+        try {
+            const { error } = await supabase.from('backups').upsert({
+                user_id: userId,
+                data: appState,
+                updated_at: new Date().toISOString()
+            }, { onConflict: 'user_id' });
+            return !error;
+        } catch (e) {
+            return false;
+        }
+    },
+    getCloudBackup: async (userId: string): Promise<any | null> => {
+        try {
+            const { data, error } = await supabase.from('backups').select('data').eq('user_id', userId).maybeSingle();
+            if (error || !data) return null;
+            return data.data;
+        } catch (e) {
+            return null;
+        }
+    },
     
     // --- STAFF AUTH (100% LOCAL) ---
     verifyStaffCredentials: async (username: string, password: string): Promise<User | null> => {
@@ -120,7 +143,7 @@ export const api = {
         await db.deleteItem(db.STORES.ROLES, id);
     },
 
-    // --- SHOP ENTITIES (IndexedDB - Local Storage) ---
+    // --- SHOP ENTITIES ---
     getProducts: async () => db.getAll<Product>(db.STORES.PRODUCTS),
     addProduct: async (product: Omit<Product, 'id'|'batches'>, firstBatch: Omit<ProductBatch, 'id'>) => {
         const productId = crypto.randomUUID();
